@@ -15,19 +15,53 @@ document.addEventListener('DOMContentLoaded', () => {
     // Maximum number of concurrent sounds
     const MAX_CONCURRENT_SOUNDS = 20;
     
-    // Keep track of active audio elements
-    const activeSounds = [];
-    
     // Keep track of recently played sounds to avoid repetition
     const recentlyPlayed = [];
     const HISTORY_SIZE = Math.min(4, soundFiles.length - 1); // Don't repeat the last 4 sounds
 
-    // Preload all audio files for better performance
-    const audioCache = soundFiles.map(file => {
-        const audio = new Audio(file);
-        audio.load(); // Preload the audio
+    // Create a pool of audio objects that we'll reuse
+    const audioPool = [];
+    const POOL_SIZE = MAX_CONCURRENT_SOUNDS + 5; // Add a buffer
+    
+    // Initialize audio pool
+    for (let i = 0; i < POOL_SIZE; i++) {
+        const audio = new Audio();
+        audio.inUse = false;
+        audioPool.push(audio);
+    }
+    
+    // Get an available audio object from the pool
+    function getAudioFromPool() {
+        // First try to find an unused one
+        let audio = audioPool.find(a => !a.inUse);
+        
+        // If none available, take the oldest one that's not playing
+        if (!audio) {
+            audio = audioPool.find(a => !a.paused && (a.currentTime >= a.duration - 0.1));
+        }
+        
+        // If still none, take the oldest one regardless
+        if (!audio) {
+            audio = audioPool[0];
+        }
+        
+        // Reset and mark as in use
+        audio.pause();
+        audio.currentTime = 0;
+        audio.inUse = true;
+        
+        // Move to end of pool (for LRU behavior)
+        const index = audioPool.indexOf(audio);
+        audioPool.splice(index, 1);
+        audioPool.push(audio);
+        
         return audio;
-    });
+    }
+    
+    // Function to release audio back to the pool
+    function releaseAudioToPool(audio) {
+        audio.inUse = false;
+    }
 
     // Function to play a varied sound (not from recently played)
     function playVariedSound() {
@@ -53,30 +87,38 @@ document.addEventListener('DOMContentLoaded', () => {
             recentlyPlayed.shift(); // Remove oldest entry
         }
         
-        // Create a new audio instance from the selected sound
-        const audioElement = new Audio(soundFiles[selectedIndex]);
+        // Get audio object from pool
+        const audioElement = getAudioFromPool();
+        audioElement.src = soundFiles[selectedIndex];
         
         // Play the sound
-        audioElement.play();
+        const playPromise = audioElement.play();
         
-        // Add to active sounds
-        activeSounds.push(audioElement);
+        // Handle play promise for browsers that return it
+        if (playPromise !== undefined) {
+            playPromise.then(() => {
+                // Playback started successfully
+            }).catch(error => {
+                // Auto-play was prevented or other error
+                console.log('Playback error:', error);
+                releaseAudioToPool(audioElement);
+            });
+        }
         
-        // Remove from active sounds when finished
+        // Release audio to pool when finished
         audioElement.addEventListener('ended', () => {
-            const index = activeSounds.indexOf(audioElement);
-            if (index !== -1) {
-                activeSounds.splice(index, 1);
+            releaseAudioToPool(audioElement);
+        }, { once: true });
+    }
+
+    // Periodically check for and clean up stuck audio elements
+    setInterval(() => {
+        audioPool.forEach(audio => {
+            if (audio.ended || audio.paused || (audio.currentTime >= audio.duration - 0.1)) {
+                releaseAudioToPool(audio);
             }
         });
-        
-        // If we have too many sounds playing, remove the oldest one
-        if (activeSounds.length > MAX_CONCURRENT_SOUNDS) {
-            const oldestSound = activeSounds.shift();
-            oldestSound.pause();
-            oldestSound.currentTime = 0;
-        }
-    }
+    }, 5000);
 
     // Add event listeners for both click and touch
     const bellContainer = document.getElementById('bell-container');
@@ -91,15 +133,28 @@ document.addEventListener('DOMContentLoaded', () => {
         playVariedSound();
     });
     
-    // Enable audio on iOS devices (which require user interaction)
-    document.addEventListener('touchstart', () => {
-        audioCache.forEach(audio => {
-            audio.play().then(() => {
-                audio.pause();
-                audio.currentTime = 0;
-            }).catch(err => {
-                // Silence error since this is just for initialization
-            });
+    // Fix for iOS Audio Context - need user interaction to initialize audio
+    function unlockAudioContext() {
+        audioPool.forEach(audio => {
+            // Just load the audio object, don't play it yet
+            audio.load();
         });
-    }, { once: true });
+        
+        // Create a temporary audio element to unlock the audio context
+        const tempAudio = new Audio(soundFiles[0]);
+        tempAudio.play().then(() => {
+            tempAudio.pause();
+            tempAudio.currentTime = 0;
+        }).catch(e => {
+            // Silence the error, this is just to unlock the audio context
+        });
+        
+        // Remove the event listeners once unlocked
+        document.removeEventListener('touchstart', unlockAudioContext, true);
+        document.removeEventListener('click', unlockAudioContext, true);
+    }
+    
+    // Add event listeners to unlock audio
+    document.addEventListener('touchstart', unlockAudioContext, true);
+    document.addEventListener('click', unlockAudioContext, true);
 }); 
